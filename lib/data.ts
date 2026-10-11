@@ -27,17 +27,42 @@ export const dataSource = supabase ? "supabase" : "seed";
  * Source of truth: Supabase when configured, otherwise data/seed.json (an exact copy).
  * Pages are statically generated and revalidated hourly.
  */
-export const getOrgs = cache(async (): Promise<Org[]> => {
+const readSeed = async () => JSON.parse(await readFile(path.join(process.cwd(), "data", "seed.json"), "utf8")) as Org[];
+
+async function loadOrgs(): Promise<Org[]> {
   let rows: Org[];
   if (supabase) {
     const { data, error } = await supabase.from("organizations_public").select("*").order("name");
-    if (error) throw new Error(`Supabase: ${error.message}`);
-    rows = (data ?? []) as Org[];
+    if (error) {
+      // A build renders ~900 pages; if the database is slow, use the bundled copy instead of failing.
+      // At runtime the seed file may not be deployed, so the error stands and the cached page is kept.
+      try {
+        rows = await readSeed();
+        console.warn(`Supabase unavailable (${error.message}); using data/seed.json`);
+      } catch {
+        throw new Error(`Supabase: ${error.message}`);
+      }
+    } else rows = (data ?? []) as Org[];
   } else {
-    // Local fallback, read at runtime so deployments don't need to ship the file.
-    rows = JSON.parse(await readFile(path.join(process.cwd(), "data", "seed.json"), "utf8")) as Org[];
+    rows = await readSeed();
   }
   return spreadAreaPins(rows, getArea).sort((a, b) => a.name.localeCompare(b.name, "en", { sensitivity: "base" }));
+}
+
+// One query shared by every page rendered in the same process for a minute, instead of one per page.
+// (React's cache() only dedupes within a single request.)
+let shared: { at: number; p: Promise<Org[]> } | null = null;
+const TTL = 60_000;
+
+export const getOrgs = cache(async (): Promise<Org[]> => {
+  if (!shared || Date.now() - shared.at > TTL) {
+    const p = loadOrgs();
+    shared = { at: Date.now(), p };
+    p.catch(() => {
+      if (shared?.p === p) shared = null;
+    });
+  }
+  return shared.p;
 });
 
 export async function getOrg(slug: string) {
@@ -60,7 +85,14 @@ export function profilePath(o: Pick<Org, "slug" | "kind">) {
  * Open roles synced from public job boards (only for published organisations; RLS enforces it).
  * Roles are extra information, so a failure here shows no roles rather than breaking the page.
  */
+let sharedJobs: { at: number; p: Promise<Job[]> } | null = null;
+
 export const getJobs = cache(async (): Promise<Job[]> => {
+  if (!sharedJobs || Date.now() - sharedJobs.at > TTL) sharedJobs = { at: Date.now(), p: loadJobs() };
+  return sharedJobs.p;
+});
+
+async function loadJobs(): Promise<Job[]> {
   if (!supabase) return [];
   const { data, error } = await supabase
     .from("jobs")
@@ -72,7 +104,7 @@ export const getJobs = cache(async (): Promise<Job[]> => {
     return [];
   }
   return (data ?? []) as Job[];
-});
+}
 
 /**
  * Published events from `fromIso` on (default: started up to 6 hours ago), soonest first.
