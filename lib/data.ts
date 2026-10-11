@@ -21,6 +21,17 @@ export const supabase =
       })
     : null;
 
+/** A struggling database can hang instead of erroring; give up after 10 s so pages fall back. */
+function within<T>(p: PromiseLike<T>, ms = 10_000): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(`no answer in ${ms / 1000} s`)), ms);
+    Promise.resolve(p).then(
+      (v) => { clearTimeout(t); resolve(v); },
+      (e) => { clearTimeout(t); reject(e); },
+    );
+  });
+}
+
 export const dataSource = supabase ? "supabase" : "seed";
 
 /**
@@ -32,7 +43,9 @@ const readSeed = async () => JSON.parse(await readFile(path.join(process.cwd(), 
 async function loadOrgs(): Promise<Org[]> {
   let rows: Org[];
   if (supabase) {
-    const { data, error } = await supabase.from("organizations_public").select("*").order("name");
+    const { data, error } = await within(supabase.from("organizations_public").select("*").order("name")).catch(
+      (e: Error) => ({ data: null, error: { message: e.message } }),
+    );
     if (error) {
       // A build renders ~900 pages; if the database is slow, use the bundled copy instead of failing.
       // At runtime the seed file may not be deployed, so the error stands and the cached page is kept.
@@ -94,11 +107,13 @@ export const getJobs = cache(async (): Promise<Job[]> => {
 
 async function loadJobs(): Promise<Job[]> {
   if (!supabase) return [];
-  const { data, error } = await supabase
-    .from("jobs")
-    .select("org_slug, title, team, location, url, posted, first_seen")
-    .order("first_seen", { ascending: false })
-    .limit(2000);
+  const { data, error } = await within(
+    supabase
+      .from("jobs")
+      .select("org_slug, title, team, location, url, posted, first_seen")
+      .order("first_seen", { ascending: false })
+      .limit(2000),
+  ).catch((e: Error) => ({ data: null, error: { message: e.message } }));
   if (error) {
     console.error("jobs unavailable:", error.message);
     return [];
@@ -119,7 +134,7 @@ export async function getEvents(opts: { fromIso?: string; toIso?: string; limit?
     .order("starts_at")
     .limit(opts.limit ?? 200);
   if (opts.toIso) q = q.lt("starts_at", opts.toIso);
-  const { data, error } = await q;
+  const { data, error } = await within(q).catch((e: Error) => ({ data: null, error: { message: e.message } }));
   if (error) {
     console.error("events unavailable:", error.message);
     return [];
